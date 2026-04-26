@@ -8,9 +8,31 @@ on:
 permissions:
   contents: write
 
+# ────────────────────────────────────────────────────────────────────────────────
+# ARCHITECTURE NOTES
+#
+# Android  : single universal APK — already contains arm64-v8a AND armeabi-v7a
+#            (arm32). No separate per-ABI APK jobs needed.
+#
+# Linux    : arm64 packages use the native ubuntu-24.04-arm runner (free for
+#            public repos, GA since Aug 2025). No arm32 Linux desktop: Compose
+#            Desktop ships no 32-bit JVM runtime and GitHub has no arm32 runner.
+#
+# iOS      : requires these secrets in your repo:
+#              IOS_CERTIFICATES_P12          — Distribution cert as base64 .p12
+#              IOS_CERTIFICATES_PASSWORD     — Password for that .p12
+#              IOS_PROVISIONING_PROFILE      — .mobileprovision as base64
+#              IOS_KEYCHAIN_PASSWORD         — Any strong random string
+#              IOS_TEAM_ID                   — 10-char Apple Team ID
+#            Also requires iosApp/ExportOptions.plist committed in your repo.
+#            Adjust -workspace / -scheme below to match your Xcode project.
+# ────────────────────────────────────────────────────────────────────────────────
+
 jobs:
+
+  # ── ANDROID ──────────────────────────────────────────────────────────────────
   apk:
-    name: Generate APK
+    name: Generate APK (universal – arm64 + arm32 + x86_64)
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -47,6 +69,77 @@ jobs:
           name: signed-apk
           path: androidApp/build/outputs/apk/foss/release/androidApp-foss-release-signed.apk
 
+  # ── iOS ──────────────────────────────────────────────────────────────────────
+  ios:
+    name: Generate IPA
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref }}
+          fetch-depth: 0
+      - name: Setup JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+      - name: Set execution flag for gradlew
+        run: chmod +x gradlew
+      - name: Install Apple certificate and provisioning profile
+        env:
+          BUILD_CERTIFICATE_BASE64: ${{ secrets.IOS_CERTIFICATES_P12 }}
+          P12_PASSWORD: ${{ secrets.IOS_CERTIFICATES_PASSWORD }}
+          BUILD_PROVISION_PROFILE_BASE64: ${{ secrets.IOS_PROVISIONING_PROFILE }}
+          KEYCHAIN_PASSWORD: ${{ secrets.IOS_KEYCHAIN_PASSWORD }}
+        run: |
+          CERTIFICATE_PATH=$RUNNER_TEMP/build_certificate.p12
+          PP_PATH=$RUNNER_TEMP/build_pp.mobileprovision
+          KEYCHAIN_PATH=$RUNNER_TEMP/app-signing.keychain-db
+
+          echo -n "$BUILD_CERTIFICATE_BASE64" | base64 --decode -o "$CERTIFICATE_PATH"
+          echo -n "$BUILD_PROVISION_PROFILE_BASE64" | base64 --decode -o "$PP_PATH"
+
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security import "$CERTIFICATE_PATH" -P "$P12_PASSWORD" -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security list-keychain -d user -s "$KEYCHAIN_PATH"
+
+          mkdir -p ~/Library/MobileDevice/Provisioning\ Profiles
+          cp "$PP_PATH" ~/Library/MobileDevice/Provisioning\ Profiles/
+      - name: Build KMP shared framework
+        # Compiles the Kotlin shared code so Xcode can pick it up
+        run: bash ./gradlew :shared:embedAndSignAppleFrameworkForXcode --stacktrace 2>/dev/null \
+          || bash ./gradlew :composeApp:embedAndSignAppleFrameworkForXcode --stacktrace 2>/dev/null \
+          || echo "No embedAndSignAppleFrameworkForXcode task found – relying on Xcode build phase"
+      - name: Archive iOS app
+        run: |
+          # Adjust -workspace and -scheme to match your Xcode project if needed.
+          xcodebuild \
+            -workspace iosApp/iosApp.xcworkspace \
+            -scheme iosApp \
+            -configuration Release \
+            -archivePath "$RUNNER_TEMP/Kai.xcarchive" \
+            archive \
+            DEVELOPMENT_TEAM="${{ secrets.IOS_TEAM_ID }}"
+      - name: Export IPA
+        run: |
+          # iosApp/ExportOptions.plist must be committed in your repo.
+          # Set the export method (ad-hoc / app-store / enterprise) inside that file.
+          xcodebuild \
+            -exportArchive \
+            -archivePath "$RUNNER_TEMP/Kai.xcarchive" \
+            -exportOptionsPlist iosApp/ExportOptions.plist \
+            -exportPath "$RUNNER_TEMP/Build"
+      - name: Upload IPA Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-ipa
+          path: ${{ runner.temp }}/Build/*.ipa
+
+  # ── macOS ─────────────────────────────────────────────────────────────────────
   dmg:
     name: Generate DMG
     runs-on: macos-latest
@@ -71,6 +164,7 @@ jobs:
           name: dmg-package
           path: composeApp/build/compose/binaries/main-release/dmg/*.dmg
 
+  # ── Windows ───────────────────────────────────────────────────────────────────
   msi:
     name: Generate MSI
     runs-on: windows-latest
@@ -93,8 +187,9 @@ jobs:
           name: msi-package
           path: composeApp/build/compose/binaries/main-release/msi/*.msi
 
+  # ── Linux x86_64 ──────────────────────────────────────────────────────────────
   deb:
-    name: Generate DEB
+    name: Generate DEB (x86_64)
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -114,11 +209,11 @@ jobs:
       - name: Upload DEB Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: deb-package
+          name: deb-amd64
           path: composeApp/build/compose/binaries/main-release/deb/*.deb
 
   rpm:
-    name: Generate RPM
+    name: Generate RPM (x86_64)
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -140,11 +235,11 @@ jobs:
       - name: Upload RPM Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: rpm-package
+          name: rpm-x86_64
           path: composeApp/build/compose/binaries/main-release/rpm/*.rpm
 
   linux-tar:
-    name: Generate Linux Tarball
+    name: Generate Linux Tarball (x86_64)
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -168,11 +263,11 @@ jobs:
       - name: Upload Tarball Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: linux-tar-package
+          name: linux-tar-x86_64
           path: Kai-linux-x86_64.tar.gz
 
   appimage:
-    name: Generate AppImage
+    name: Generate AppImage (x86_64)
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -190,26 +285,24 @@ jobs:
       - name: Install AppImage tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y libfuse2 file
+          sudo apt-get install -y file
+          # libfuse2 is needed at runtime but not for --appimage-extract-and-run
+          sudo apt-get install -y libfuse2 || sudo apt-get install -y libfuse2t64 || true
           wget -q https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage
           chmod +x appimagetool-x86_64.AppImage
       - name: Build application distribution
         run: ./gradlew createReleaseDistributable --stacktrace
       - name: Create AppDir structure
         run: |
-          mkdir -p AppDir/usr/bin
           mkdir -p AppDir/usr/lib
           mkdir -p AppDir/usr/share/applications
           mkdir -p AppDir/usr/share/icons/hicolor/256x256/apps
 
-          # Copy distributable contents
           cp -r composeApp/build/compose/binaries/main-release/app/Kai/* AppDir/usr/lib/
 
-          # Copy icon
           cp composeApp/icon.png AppDir/usr/share/icons/hicolor/256x256/apps/kai.png
           cp composeApp/icon.png AppDir/kai.png
 
-          # Create desktop file
           cat > AppDir/kai.desktop << 'EOF'
           [Desktop Entry]
           Name=Kai
@@ -222,7 +315,6 @@ jobs:
           EOF
           cp AppDir/kai.desktop AppDir/usr/share/applications/
 
-          # Create AppRun
           cat > AppDir/AppRun << 'EOF'
           #!/bin/bash
           SELF=$(readlink -f "$0")
@@ -238,11 +330,160 @@ jobs:
       - name: Upload AppImage Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: appimage-package
-          path: Kai-*.AppImage
+          name: appimage-x86_64
+          path: Kai-x86_64.AppImage
 
+  # ── Linux arm64 ───────────────────────────────────────────────────────────────
+  # Uses the native ubuntu-24.04-arm runner (free for public repos).
+  # NOTE: only works in PUBLIC repositories; private repos need a paid arm64
+  # larger runner configured in your org settings.
+  deb-arm64:
+    name: Generate DEB (arm64)
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref }}
+          fetch-depth: 0
+      - name: Setup JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+      - name: Set execution flag for gradlew
+        run: chmod +x gradlew
+      - name: Build DEB
+        run: ./gradlew packageReleaseDeb --stacktrace
+      - name: Upload DEB arm64 Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: deb-arm64
+          path: composeApp/build/compose/binaries/main-release/deb/*.deb
+
+  rpm-arm64:
+    name: Generate RPM (arm64)
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref }}
+          fetch-depth: 0
+      - name: Setup JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+      - name: Set execution flag for gradlew
+        run: chmod +x gradlew
+      - name: Install RPM build tools
+        run: sudo apt-get update && sudo apt-get install -y rpm
+      - name: Build RPM
+        run: ./gradlew packageReleaseRpm --stacktrace
+      - name: Upload RPM arm64 Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rpm-aarch64
+          path: composeApp/build/compose/binaries/main-release/rpm/*.rpm
+
+  linux-tar-arm64:
+    name: Generate Linux Tarball (arm64)
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref }}
+          fetch-depth: 0
+      - name: Setup JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+      - name: Set execution flag for gradlew
+        run: chmod +x gradlew
+      - name: Build application distribution
+        run: ./gradlew createReleaseDistributable --stacktrace
+      - name: Create tarball
+        run: |
+          cd composeApp/build/compose/binaries/main-release/app
+          tar czf "$GITHUB_WORKSPACE/Kai-linux-aarch64.tar.gz" Kai
+      - name: Upload Tarball arm64 Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-tar-aarch64
+          path: Kai-linux-aarch64.tar.gz
+
+  appimage-arm64:
+    name: Generate AppImage (arm64)
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref }}
+          fetch-depth: 0
+      - name: Setup JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+      - name: Set execution flag for gradlew
+        run: chmod +x gradlew
+      - name: Install AppImage tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y file
+          sudo apt-get install -y libfuse2 || sudo apt-get install -y libfuse2t64 || true
+          wget -q https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-aarch64.AppImage
+          chmod +x appimagetool-aarch64.AppImage
+      - name: Build application distribution
+        run: ./gradlew createReleaseDistributable --stacktrace
+      - name: Create AppDir structure
+        run: |
+          mkdir -p AppDir/usr/lib
+          mkdir -p AppDir/usr/share/applications
+          mkdir -p AppDir/usr/share/icons/hicolor/256x256/apps
+
+          cp -r composeApp/build/compose/binaries/main-release/app/Kai/* AppDir/usr/lib/
+
+          cp composeApp/icon.png AppDir/usr/share/icons/hicolor/256x256/apps/kai.png
+          cp composeApp/icon.png AppDir/kai.png
+
+          cat > AppDir/kai.desktop << 'EOF'
+          [Desktop Entry]
+          Name=Kai
+          Comment=AI Assistant Application
+          Exec=kai
+          Icon=kai
+          Type=Application
+          Categories=Utility;
+          Terminal=false
+          EOF
+          cp AppDir/kai.desktop AppDir/usr/share/applications/
+
+          cat > AppDir/AppRun << 'EOF'
+          #!/bin/bash
+          SELF=$(readlink -f "$0")
+          HERE=${SELF%/*}
+          export PATH="${HERE}/usr/lib/bin:${PATH}"
+          export LD_LIBRARY_PATH="${HERE}/usr/lib/lib/runtime/lib:${LD_LIBRARY_PATH}"
+          exec "${HERE}/usr/lib/bin/Kai" "$@"
+          EOF
+          chmod +x AppDir/AppRun
+      - name: Build AppImage
+        run: |
+          ARCH=aarch64 ./appimagetool-aarch64.AppImage --appimage-extract-and-run AppDir Kai-aarch64.AppImage
+      - name: Upload AppImage arm64 Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: appimage-aarch64
+          path: Kai-aarch64.AppImage
+
+  # ── Flatpak x86_64 ────────────────────────────────────────────────────────────
   flatpak:
-    name: Generate Flatpak
+    name: Generate Flatpak (x86_64)
     needs: [linux-tar]
     runs-on: ubuntu-latest
     steps:
@@ -254,7 +495,7 @@ jobs:
       - name: Download Linux Tarball
         uses: actions/download-artifact@v4.1.7
         with:
-          name: linux-tar-package
+          name: linux-tar-x86_64
       - name: Install Flatpak and Builder
         run: |
           sudo apt-get update
@@ -263,24 +504,64 @@ jobs:
           sudo flatpak install -y flathub org.freedesktop.Platform//24.08 org.freedesktop.Sdk//24.08
       - name: Build Flatpak
         run: |
-          # Copy tarball to flatpak dir and compute sha256
           cp Kai-linux-x86_64.tar.gz flatpak/
           SHA256=$(sha256sum Kai-linux-x86_64.tar.gz | cut -d' ' -f1)
 
-          # Patch manifest to use local tarball instead of URL
           cd flatpak
           sed -i "s|url: https://github.com/SimonSchubert/Kai/releases/download/.*|path: Kai-linux-x86_64.tar.gz|" io.github.simonschubert.Kai.yaml
           sed -i "s|sha256: .*|sha256: ${SHA256}|" io.github.simonschubert.Kai.yaml
 
-          # Build and bundle
           flatpak-builder --repo=repo --force-clean build-dir io.github.simonschubert.Kai.yaml
-          flatpak build-bundle repo ../Kai.flatpak io.github.simonschubert.Kai
+          flatpak build-bundle repo ../Kai-x86_64.flatpak io.github.simonschubert.Kai
       - name: Upload Flatpak Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: flatpak-package
-          path: Kai.flatpak
+          name: flatpak-x86_64
+          path: Kai-x86_64.flatpak
 
+  # ── Flatpak arm64 ─────────────────────────────────────────────────────────────
+  flatpak-arm64:
+    name: Generate Flatpak (arm64)
+    needs: [linux-tar-arm64]
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref }}
+          fetch-depth: 0
+      - name: Download Linux Tarball arm64
+        uses: actions/download-artifact@v4.1.7
+        with:
+          name: linux-tar-aarch64
+      - name: Install Flatpak and Builder
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y flatpak flatpak-builder
+          sudo flatpak remote-add --if-not-exists flathub https://flathub.org/repo/flathub.flatpakrepo
+          sudo flatpak install -y flathub org.freedesktop.Platform//24.08 org.freedesktop.Sdk//24.08
+      - name: Build Flatpak
+        run: |
+          cp Kai-linux-aarch64.tar.gz flatpak/
+          SHA256=$(sha256sum Kai-linux-aarch64.tar.gz | cut -d' ' -f1)
+
+          cd flatpak
+          # Patch the manifest to use the local arm64 tarball
+          sed -i "s|url: https://github.com/SimonSchubert/Kai/releases/download/.*|path: Kai-linux-aarch64.tar.gz|" io.github.simonschubert.Kai.yaml
+          sed -i "s|path: Kai-linux-x86_64.tar.gz|path: Kai-linux-aarch64.tar.gz|" io.github.simonschubert.Kai.yaml
+          sed -i "s|sha256: .*|sha256: ${SHA256}|" io.github.simonschubert.Kai.yaml
+          # Remove any hardcoded x86_64 arch constraint from the manifest
+          sed -i 's/^  arch: x86_64/  arch: aarch64/' io.github.simonschubert.Kai.yaml
+
+          flatpak-builder --repo=repo --force-clean build-dir io.github.simonschubert.Kai.yaml
+          flatpak build-bundle repo ../Kai-aarch64.flatpak io.github.simonschubert.Kai
+      - name: Upload Flatpak arm64 Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: flatpak-aarch64
+          path: Kai-aarch64.flatpak
+
+  # ── Play Store ────────────────────────────────────────────────────────────────
   play-store:
     name: Upload AAB to Play Store
     runs-on: ubuntu-latest
@@ -317,9 +598,24 @@ jobs:
       - name: Deploy to Play Store
         run: bundle exec fastlane android deploy
 
+  # ── GitHub Release ────────────────────────────────────────────────────────────
   release:
-    name: Release APK, DMG, MSI, DEB, RPM, AppImage, Flatpak and Tarball
-    needs: [apk, dmg, msi, deb, rpm, appimage, linux-tar, flatpak]
+    name: Release all artifacts
+    needs:
+      - apk
+      - ios
+      - dmg
+      - msi
+      - deb
+      - rpm
+      - appimage
+      - linux-tar
+      - flatpak
+      - deb-arm64
+      - rpm-arm64
+      - appimage-arm64
+      - linux-tar-arm64
+      - flatpak-arm64
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -328,60 +624,97 @@ jobs:
           ref: ${{ github.ref }}
           fetch-depth: 0
 
-      - name: Download APK Artifact
+      # Download each artifact into its own subdirectory to avoid filename clashes
+      - name: Download APK
         uses: actions/download-artifact@v4.1.7
         with:
           name: signed-apk
-
-      - name: Download DMG Artifact
+          path: dist/android
+      - name: Download IPA
+        uses: actions/download-artifact@v4.1.7
+        with:
+          name: ios-ipa
+          path: dist/ios
+      - name: Download DMG
         uses: actions/download-artifact@v4.1.7
         with:
           name: dmg-package
-
-      - name: Download MSI Artifact
+          path: dist/macos
+      - name: Download MSI
         uses: actions/download-artifact@v4.1.7
         with:
           name: msi-package
-
-      - name: Download DEB Artifact
+          path: dist/msi
+      - name: Download DEB x86_64
         uses: actions/download-artifact@v4.1.7
         with:
-          name: deb-package
-
-      - name: Download RPM Artifact
+          name: deb-amd64
+          path: dist/deb-amd64
+      - name: Download RPM x86_64
         uses: actions/download-artifact@v4.1.7
         with:
-          name: rpm-package
-
-      - name: Download AppImage Artifact
+          name: rpm-x86_64
+          path: dist/rpm-x86_64
+      - name: Download AppImage x86_64
         uses: actions/download-artifact@v4.1.7
         with:
-          name: appimage-package
-
-      - name: Download Linux Tarball Artifact
+          name: appimage-x86_64
+          path: dist/appimage-x86_64
+      - name: Download Tarball x86_64
         uses: actions/download-artifact@v4.1.7
         with:
-          name: linux-tar-package
-
-      - name: Download Flatpak Artifact
+          name: linux-tar-x86_64
+          path: dist/tar-x86_64
+      - name: Download Flatpak x86_64
         uses: actions/download-artifact@v4.1.7
         with:
-          name: flatpak-package
-
-      - name: List downloaded files (for debugging)
-        run: ls -la
+          name: flatpak-x86_64
+          path: dist/flatpak-x86_64
+      - name: Download DEB arm64
+        uses: actions/download-artifact@v4.1.7
+        with:
+          name: deb-arm64
+          path: dist/deb-arm64
+      - name: Download RPM arm64
+        uses: actions/download-artifact@v4.1.7
+        with:
+          name: rpm-aarch64
+          path: dist/rpm-aarch64
+      - name: Download AppImage arm64
+        uses: actions/download-artifact@v4.1.7
+        with:
+          name: appimage-aarch64
+          path: dist/appimage-aarch64
+      - name: Download Tarball arm64
+        uses: actions/download-artifact@v4.1.7
+        with:
+          name: linux-tar-aarch64
+          path: dist/tar-aarch64
+      - name: Download Flatpak arm64
+        uses: actions/download-artifact@v4.1.7
+        with:
+          name: flatpak-aarch64
+          path: dist/flatpak-aarch64
 
       - name: Rename assets
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
-          mv androidApp-foss-release-signed.apk "Kai-${VERSION}-android.apk"
-          mv *.dmg "Kai-${VERSION}-macos.dmg"
-          mv *.msi "Kai-${VERSION}-windows.msi"
-          mv *.deb "Kai-${VERSION}-linux.deb"
-          mv *.rpm "Kai-${VERSION}-linux.rpm"
-          mv *.AppImage "Kai-${VERSION}-linux.AppImage"
-          mv Kai-linux-x86_64.tar.gz "Kai-${VERSION}-linux-x86_64.tar.gz"
-          mv Kai.flatpak "Kai-${VERSION}-linux.flatpak"
+          mkdir -p release
+
+          mv dist/android/androidApp-foss-release-signed.apk  "release/Kai-${VERSION}-android.apk"
+          mv dist/ios/*.ipa                                     "release/Kai-${VERSION}-ios.ipa"
+          mv dist/macos/*.dmg                                   "release/Kai-${VERSION}-macos.dmg"
+          mv dist/msi/*.msi                                     "release/Kai-${VERSION}-windows.msi"
+          mv dist/deb-amd64/*.deb                               "release/Kai-${VERSION}-linux-amd64.deb"
+          mv dist/rpm-x86_64/*.rpm                              "release/Kai-${VERSION}-linux-x86_64.rpm"
+          mv dist/appimage-x86_64/Kai-x86_64.AppImage          "release/Kai-${VERSION}-linux-x86_64.AppImage"
+          mv dist/tar-x86_64/Kai-linux-x86_64.tar.gz           "release/Kai-${VERSION}-linux-x86_64.tar.gz"
+          mv dist/flatpak-x86_64/Kai-x86_64.flatpak            "release/Kai-${VERSION}-linux-x86_64.flatpak"
+          mv dist/deb-arm64/*.deb                               "release/Kai-${VERSION}-linux-arm64.deb"
+          mv dist/rpm-aarch64/*.rpm                             "release/Kai-${VERSION}-linux-aarch64.rpm"
+          mv dist/appimage-aarch64/Kai-aarch64.AppImage         "release/Kai-${VERSION}-linux-aarch64.AppImage"
+          mv dist/tar-aarch64/Kai-linux-aarch64.tar.gz          "release/Kai-${VERSION}-linux-aarch64.tar.gz"
+          mv dist/flatpak-aarch64/Kai-aarch64.flatpak           "release/Kai-${VERSION}-linux-aarch64.flatpak"
 
       - name: Extract changelog
         run: |
@@ -389,7 +722,6 @@ jobs:
           if [ -f CHANGELOG.md ]; then
             sed -n "/^## v${VERSION}/,/^## v/{ /^## v${VERSION}/d; /^## v/d; p; }" CHANGELOG.md > changelog.txt
           fi
-          # Fallback if CHANGELOG.md missing or section empty
           if [ ! -s changelog.txt ]; then
             PREVIOUS_TAG=$(git tag --sort=-creatordate | grep -v "^${GITHUB_REF_NAME}$" | head -n1)
             if [ -z "$PREVIOUS_TAG" ]; then
@@ -399,12 +731,12 @@ jobs:
             fi
           fi
 
-      - name: Create Github Release
+      - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           name: Release ${{ github.ref_name }}
           body_path: changelog.txt
-          files: Kai-*
+          files: release/Kai-*
 
       - name: Sync winget-pkgs fork
         env:
